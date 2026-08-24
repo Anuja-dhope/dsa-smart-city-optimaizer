@@ -1,0 +1,9 @@
+77|police|b|0|Assigned|32
+2222|POLICE|b|0|Assigned|22
+4566436|police|karvenagar|0|Assigned|23424
+1233|Ambulance|mumbai|0|Completed|1234
+1233|Ambulance|nagpur|0|Pending|None
+1233|Fire Brigade|nashik|0|Completed|12345
+1233|Ambulance|nagar|1|Pending|None
+abcd|Ambulance|c|0|Assigned|123
+789|Fire Brigade|C|1|Assigned|123

@@ -1,0 +1,17 @@
+123,hello,municipal
+12,21,municipal
+2332,32,citizen
+566,hi,municipal
+77,hello,citizen
+222,222,municipal
+2222,22,citizen
+123888,as@32,citizen
+1609,guddu,municipal
+456436,fgj,municipal
+4566436,fgj,citizen
+1233,guddu,citizen
+12d,23,citizen
+abc,abc,municipal
+abcd,abcd,citizen
+anuja,anuja,municipal
+789,789,citizen
