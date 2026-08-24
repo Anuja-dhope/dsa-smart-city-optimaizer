@@ -43,6 +43,10 @@ public class MainGUIPastel {
     private static GraphPanel graphPanel;
 
     public static void main(String[] args) {
+        // Load persisted city configuration before the GUI opens.
+        // This populates the shared 'city' CityGraph so areas, roads, and resources
+        // are immediately visible on the dashboard without manual re-entry.
+        CityPersistenceManager.loadConfiguration(city);
         // Use Swing thread
         SwingUtilities.invokeLater(MainGUIPastel::createAndShowLogin);
     }
@@ -275,6 +279,7 @@ public class MainGUIPastel {
             String area = JOptionPane.showInputDialog(null, "Enter new area name:");
             if (area != null && !area.trim().isEmpty()) {
                 city.addArea(area.trim());
+                CityPersistenceManager.saveCities(city); // persist new area immediately
                 appendOutput("Area added: " + area.trim());
                 graphPanel.repaint();
             }
@@ -304,6 +309,7 @@ public class MainGUIPastel {
                     }
                     int dist = Integer.parseInt(d.getText().trim());
                     city.addRoad(aa, bb, dist);
+                    CityPersistenceManager.saveEdges(city); // persist updated road network immediately
                     appendOutput("Road added: " + aa + " <-> " + bb + " (" + dist + " km)");
                     graphPanel.repaint();
                 } catch (Exception ex) {
@@ -354,6 +360,7 @@ public class MainGUIPastel {
                     return;
                 }
                 city.addResource(centerArea, new Resource(resType, vehId, drvName));
+                CityPersistenceManager.saveResources(city); // persist new resource immediately
                 appendOutput("Resource " + vehId + " added at " + centerArea);
                 graphPanel.repaint();
             }

@@ -15,3 +15,4 @@ abc,abc,municipal
 abcd,abcd,citizen
 anuja,anuja,municipal
 789,789,citizen
+24,24,citizen

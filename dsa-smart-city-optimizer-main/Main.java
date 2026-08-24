@@ -156,6 +156,14 @@ class CityGraph {
             System.out.println("Resource center not found for area.");
             return;
         }
+        // Guard against duplicate IDs (e.g. if loadConfiguration is inadvertently
+        // called more than once on the same CityGraph instance).
+        for (Resource existing : resources.get(area)) {
+            if (existing.id.equals(r.id)) {
+                System.out.println("[Persistence] Skipping duplicate resource ID: " + r.id + " at " + area);
+                return;
+            }
+        }
         resources.get(area).add(r);
         System.out.println("Resource added successfully at " + area);
     }
@@ -231,6 +239,47 @@ class CityGraph {
         return path;
     }
 
+    /**
+     * Returns true if the given request is compatible with the given resource.
+     * Compatibility is defined as matching resource types (case-insensitive).
+     * Keeping this isolated makes the dispatch logic easy to extend later.
+     */
+    private boolean isCompatible(Request req, Resource res) {
+        return req.type.equalsIgnoreCase(res.type);
+    }
+
+    /**
+     * Scans the pending requestQueue (in arrival order) and returns the best
+     * request to dispatch to the given available resource, according to:
+     *
+     *   PRIMARY   : highest priority (lowest numeric value — 0 > 1 > 2)
+     *   SECONDARY : resource compatibility (req.type must match res.type)
+     *   TERTIARY  : FIFO / oldest arrival order wins ties
+     *
+     * The queue is maintained in pure arrival order (addLast only), so the
+     * first compatible request encountered at a given priority level is
+     * automatically the oldest one at that level — no secondary sort needed.
+     *
+     * Returns null if no compatible request exists (resource stays available).
+     */
+    private Request findBestRequestForResource(Resource res) {
+        Request best = null;
+        for (Request r : requestQueue) {
+            if (!isCompatible(r, res)) {
+                continue; // skip incompatible resource types
+            }
+            if (best == null) {
+                best = r; // first compatible candidate
+            } else if (r.priority < best.priority) {
+                // lower numeric value = higher urgency; prefer this one
+                best = r;
+            }
+            // equal priority: keep 'best' because it arrived earlier
+            // (queue is in arrival order, so the earlier element was seen first)
+        }
+        return best;
+    }
+
     Resource allocateResource(Request req) {
         String emergencyArea = req.location;
         String type = req.type;
@@ -250,13 +299,13 @@ class CityGraph {
                 }
             }
         }
-        // If not allocated, add to queue+
+        // No resource available — enqueue in arrival order.
+        // IMPORTANT: always use addLast() so the queue reflects true arrival
+        // order. Priority is resolved at dispatch time by findBestRequestForResource(),
+        // NOT by reordering the queue here. Using addFirst() for high-priority
+        // requests was the root cause of the FIFO-violation bug.
         req.status = "Queued";
-        if (req.priority == 0) {
-            requestQueue.addFirst(req);
-        } else {
-            requestQueue.addLast(req);
-        }
+        requestQueue.addLast(req);
         System.out.println("No available resource of type " + type + ". Request queued (Priority: " + req.priority + ").");
         return null;
     }
@@ -282,32 +331,46 @@ class CityGraph {
             return;
         }
 
-        // Check Deque requestQueue for any matching queued requests
+        // Use findBestRequestForResource() to select the optimal pending request.
+        // This enforces: highest priority → compatible type → FIFO arrival order.
+        // The old code used a simple forward-iterator first-match, which ignored
+        // priority entirely and could dispatch a lower-priority request over a
+        // higher-priority one that appeared later in the deque.
+        Request pending = findBestRequestForResource(freedResource);
+
+        if (pending == null) {
+            // No compatible queued request — resource remains available.
+            return;
+        }
+
+        // Dispatch: mark resource busy and update request state.
+        freedResource.available = false;
+        pending.allocatedResource = freedResource.id;
+        pending.status = "Assigned";
+
+        System.out.println("\n[Queue Dispatch] Automatically assigning freed resource " + freedResource.id + " to queued request from " + pending.requesterID);
+        List<String> path = shortestPath(freedArea, pending.location);
+        System.out.println("Driver: " + freedResource.driverName);
+        if (path.isEmpty()) {
+            System.out.println("No direct path found.");
+        } else {
+            System.out.println("Shortest path: " + path);
+        }
+
+        // Remove only the dispatched request; preserve all others in arrival order.
+        // Iterator.remove() is the clean O(n) way to remove a specific element
+        // from an ArrayDeque without disturbing the rest of the queue.
         Iterator<Request> it = requestQueue.iterator();
         while (it.hasNext()) {
-            Request pending = it.next();
-            if (pending.type.equalsIgnoreCase(freedResource.type)) {
-                freedResource.available = false;
-                pending.allocatedResource = freedResource.id;
-                pending.status = "Assigned";
-
-                System.out.println("\n[Queue Dispatch] Automatically assigning freed resource " + freedResource.id + " to queued request from " + pending.requesterID);
-                List<String> path = shortestPath(freedArea, pending.location);
-                System.out.println("Driver: " + freedResource.driverName);
-                if (path.isEmpty()) {
-                    System.out.println("No direct path found.");
-                } else {
-                    System.out.println("Shortest path: " + path);
-                }
-
-                // Trigger listener callback for persistence sync in GUI
-                if (onQueueDispatchListener != null) {
-                    onQueueDispatchListener.accept(pending);
-                }
-
+            if (it.next() == pending) { // identity check — same object reference
                 it.remove();
                 break;
             }
+        }
+
+        // Trigger listener callback for persistence sync in GUI.
+        if (onQueueDispatchListener != null) {
+            onQueueDispatchListener.accept(pending);
         }
     }
 }
@@ -357,11 +420,218 @@ class HistoryManager {
     }
 }
 
+// ============================== CLASS: CityPersistenceManager ==============================
+/**
+ * Responsible for reading and writing the city configuration (areas, roads,
+ * resources) to/from text files in the data/ directory.
+ *
+ * Separation of concerns:
+ *   CityGraph           → graph data + algorithms (unchanged)
+ *   CityPersistenceManager → file I/O only
+ *   GUI / Main          → user interaction only
+ *
+ * File layout (relative paths — works on any machine):
+ *   data/cities.txt    — one area name per line
+ *   data/edges.txt     — source,destination,distance  (undirected; stored once)
+ *   data/resources.txt — area|type|id|driverName
+ */
+class CityPersistenceManager {
+
+    static final String DATA_DIR      = "data";
+    static final String CITIES_FILE   = DATA_DIR + File.separator + "cities.txt";
+    static final String EDGES_FILE    = DATA_DIR + File.separator + "edges.txt";
+    static final String RESOURCES_FILE = DATA_DIR + File.separator + "resources.txt";
+
+    /** Creates the data/ directory if it does not already exist. */
+    private static void ensureDataDir() {
+        File dir = new File(DATA_DIR);
+        if (!dir.exists()) {
+            dir.mkdirs();
+        }
+    }
+
+    /**
+     * Loads cities, edges, and resources from the data/ files into the given
+     * CityGraph. Must be called ONCE on a fresh CityGraph at application startup.
+     * Missing files are silently skipped — empty configuration is the default.
+     */
+    static void loadConfiguration(CityGraph city) {
+        ensureDataDir();
+        loadCities(city);
+        loadEdges(city);
+        loadResources(city);
+    }
+
+    // -------- SAVE --------
+
+    /**
+     * Overwrites data/cities.txt with the current set of areas (adj.keySet()).
+     * Called immediately after every successful addArea().
+     */
+    static void saveCities(CityGraph city) {
+        ensureDataDir();
+        try (BufferedWriter bw = new BufferedWriter(new FileWriter(CITIES_FILE, false))) {
+            for (String area : city.adj.keySet()) {
+                bw.write(area);
+                bw.newLine();
+            }
+        } catch (IOException e) {
+            System.err.println("[Persistence] Error saving cities: " + e.getMessage());
+        }
+    }
+
+    /**
+     * Overwrites data/edges.txt with the current road network.
+     * Each undirected edge is stored once (canonical order: A,B where A <= B).
+     * CityGraph.addRoad() stores both directions, so calling addRoad(A,B,d) on
+     * load correctly reconstructs A->B and B->A without duplication.
+     * Called immediately after every successful addRoad().
+     */
+    static void saveEdges(CityGraph city) {
+        ensureDataDir();
+        Set<String> written = new HashSet<>();
+        try (BufferedWriter bw = new BufferedWriter(new FileWriter(EDGES_FILE, false))) {
+            for (Map.Entry<String, Map<String, Integer>> entry : city.adj.entrySet()) {
+                String a = entry.getKey();
+                for (Map.Entry<String, Integer> edge : entry.getValue().entrySet()) {
+                    String b = edge.getKey();
+                    int dist = edge.getValue();
+                    // Use canonical key (smaller string first) to write each edge once.
+                    String key = (a.compareTo(b) <= 0) ? a + "|" + b : b + "|" + a;
+                    if (written.add(key)) {
+                        bw.write(a + "," + b + "," + dist);
+                        bw.newLine();
+                    }
+                }
+            }
+        } catch (IOException e) {
+            System.err.println("[Persistence] Error saving edges: " + e.getMessage());
+        }
+    }
+
+    /**
+     * Overwrites data/resources.txt with all resources currently registered.
+     * Format per line: area|type|id|driverName
+     * Resources are always restored as AVAILABLE on the next startup (see loadResources).
+     * Called immediately after every successful addResource().
+     */
+    static void saveResources(CityGraph city) {
+        ensureDataDir();
+        try (BufferedWriter bw = new BufferedWriter(new FileWriter(RESOURCES_FILE, false))) {
+            for (Map.Entry<String, List<Resource>> entry : city.resources.entrySet()) {
+                String area = entry.getKey();
+                for (Resource r : entry.getValue()) {
+                    bw.write(area + "|" + r.type + "|" + r.id + "|" + r.driverName);
+                    bw.newLine();
+                }
+            }
+        } catch (IOException e) {
+            System.err.println("[Persistence] Error saving resources: " + e.getMessage());
+        }
+    }
+
+    // -------- LOAD --------
+
+    private static void loadCities(CityGraph city) {
+        File f = new File(CITIES_FILE);
+        if (!f.exists()) return; // no saved config yet — start empty
+        int lineNum = 0;
+        try (BufferedReader br = new BufferedReader(new FileReader(f))) {
+            String line;
+            while ((line = br.readLine()) != null) {
+                lineNum++;
+                line = line.trim();
+                if (line.isEmpty()) continue;
+                city.addArea(line);
+            }
+        } catch (IOException e) {
+            System.err.println("[Persistence] Error loading cities at line " + lineNum + ": " + e.getMessage());
+        }
+    }
+
+    private static void loadEdges(CityGraph city) {
+        File f = new File(EDGES_FILE);
+        if (!f.exists()) return;
+        int lineNum = 0;
+        try (BufferedReader br = new BufferedReader(new FileReader(f))) {
+            String line;
+            while ((line = br.readLine()) != null) {
+                lineNum++;
+                line = line.trim();
+                if (line.isEmpty()) continue;
+                String[] parts = line.split(",");
+                if (parts.length != 3) {
+                    System.err.println("[Persistence] Skipping invalid edge at line " + lineNum + ": " + line);
+                    continue;
+                }
+                try {
+                    String a = parts[0].trim();
+                    String b = parts[1].trim();
+                    int dist = Integer.parseInt(parts[2].trim());
+                    city.addRoad(a, b, dist);
+                } catch (NumberFormatException e) {
+                    System.err.println("[Persistence] Skipping edge with non-integer distance at line " + lineNum + ": " + line);
+                }
+            }
+        } catch (IOException e) {
+            System.err.println("[Persistence] Error loading edges at line " + lineNum + ": " + e.getMessage());
+        }
+    }
+
+    /**
+     * Restores resources from data/resources.txt.
+     *
+     * IMPORTANT — resources are always restored as AVAILABLE regardless of
+     * their state when the application was last closed. This is intentional:
+     * the application has no mechanism to persist active request assignments,
+     * so restoring a resource as BUSY would create a phantom task with no
+     * matching request record. AVAILABLE is the safe default; a municipal
+     * operator can re-assign if needed.
+     */
+    private static void loadResources(CityGraph city) {
+        File f = new File(RESOURCES_FILE);
+        if (!f.exists()) return;
+        int lineNum = 0;
+        try (BufferedReader br = new BufferedReader(new FileReader(f))) {
+            String line;
+            while ((line = br.readLine()) != null) {
+                lineNum++;
+                line = line.trim();
+                if (line.isEmpty()) continue;
+                String[] parts = line.split("\\|", -1);
+                if (parts.length != 4) {
+                    System.err.println("[Persistence] Skipping invalid resource at line " + lineNum + ": " + line);
+                    continue;
+                }
+                String area       = parts[0].trim();
+                String type       = parts[1].trim();
+                String id         = parts[2].trim();
+                String driverName = parts[3].trim();
+                if (area.isEmpty() || type.isEmpty() || id.isEmpty()) {
+                    System.err.println("[Persistence] Skipping resource with empty fields at line " + lineNum);
+                    continue;
+                }
+                // Ensure the area exists as a resource center.
+                // addResourceCenter uses putIfAbsent, so safe to call even if already loaded.
+                city.addResourceCenter(area);
+                Resource r = new Resource(type, id, driverName);
+                r.available = true; // always AVAILABLE on restart (see Javadoc above)
+                city.addResource(area, r);
+            }
+        } catch (IOException e) {
+            System.err.println("[Persistence] Error loading resources at line " + lineNum + ": " + e.getMessage());
+        }
+    }
+}
+
 // ============================== MAIN CLASS ==============================
 public class Main {
     public static void main(String[] args) {
         Scanner sc = new Scanner(System.in);
         CityGraph city = new CityGraph();
+        // Load persisted city configuration (areas, roads, resources).
+        // Runs once on a fresh CityGraph — no risk of duplicate data.
+        CityPersistenceManager.loadConfiguration(city);
 
         while (true) {
             System.out.println("\n===== SMART CITY EMERGENCY RESOURCE OPTIMIZER =====");
@@ -406,6 +676,7 @@ public class Main {
                         case 1 -> {
                             System.out.print("Enter area: ");
                             city.addArea(sc.next());
+                            CityPersistenceManager.saveCities(city); // persist new area
                         }
                         case 2 -> {
                             System.out.print("Enter area1: ");
@@ -415,6 +686,7 @@ public class Main {
                             System.out.print("Enter distance (km): ");
                             int d = sc.nextInt();
                             city.addRoad(a, b, d);
+                            CityPersistenceManager.saveEdges(city); // persist updated road network
                         }
                         case 3 -> city.displayMap();
                         case 4 -> {
@@ -431,6 +703,7 @@ public class Main {
                             System.out.print("Enter driver name: ");
                             String dn = sc.next();
                             city.addResource(area, new Resource(type, id, dn));
+                            CityPersistenceManager.saveResources(city); // persist new resource
                         }
                         case 6 -> city.showAllResources();
                         case 7 -> {
